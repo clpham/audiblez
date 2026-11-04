@@ -8,9 +8,7 @@ from audiblez.voices import voices, available_voices_str
 def cli_main():
     voices_str = ", ".join(voices)
     epilog = (
-        "example:\n"
-        + "  audiblez book.epub -l en-us -v af_sky\n\n"
-        + "to run GUI just run:\n"
+        "example:\n" + "  audiblez book.epub -v af_sky\n\n" + "to run GUI just run:\n"
         "  audiblez-ui\n\n" + "available voices:\n" + available_voices_str
     )
     default_voice = "af_sky"
@@ -34,13 +32,13 @@ def cli_main():
     parser.add_argument(
         "-s", "--speed", default=1.0, help=f"Set speed from 0.5 to 2.0", type=float
     )
-    parser.add_argument(
-        "-c",
-        # "--cuda",
-        default=False,
-        help=f"Use GPU via Cuda in Torch if available",
-        action="store_true",
-    )
+    # parser.add_argument(
+    #     "-c",
+    #     # "--cuda",
+    #     default=False,
+    #     help=f"Use GPU via Cuda in Torch if available",
+    #     action="store_true",
+    # )
     parser.add_argument(
         "-o",
         "--output",

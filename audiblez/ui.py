@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 # A simple wxWidgets UI for audiblez
 
-import torch.cuda
 import numpy as np
 import soundfile
 import threading
@@ -271,21 +270,21 @@ class MainWindow(wx.Frame):
 
         engine_label = wx.StaticText(panel, label="Engine:")
         engine_radio_panel = wx.Panel(panel)
-        cpu_radio = wx.RadioButton(engine_radio_panel, label="CPU", style=wx.RB_GROUP)
-        cuda_radio = wx.RadioButton(engine_radio_panel, label="CUDA")
-        if torch.cuda.is_available():
-            cuda_radio.SetValue(True)
-        else:
-            cpu_radio.SetValue(True)
-            # cuda_radio.Disable()
+        # cpu_radio = wx.RadioButton(engine_radio_panel, label="CPU", style=wx.RB_GROUP)
+        # cuda_radio = wx.RadioButton(engine_radio_panel, label="CUDA")
+        # if torch.cuda.is_available():
+        #     cuda_radio.SetValue(True)
+        # else:
+        #     cpu_radio.SetValue(True)
+        #     # cuda_radio.Disable()
         sizer.Add(engine_label, pos=(0, 0), flag=wx.ALL, border=border)
         sizer.Add(engine_radio_panel, pos=(0, 1), flag=wx.ALL, border=border)
         engine_radio_panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
         engine_radio_panel.SetSizer(engine_radio_panel_sizer)
-        engine_radio_panel_sizer.Add(cpu_radio, 0, wx.ALL, 5)
-        engine_radio_panel_sizer.Add(cuda_radio, 0, wx.ALL, 5)
-        cpu_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cpu'))
-        cuda_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cuda'))
+        # engine_radio_panel_sizer.Add(cpu_radio, 0, wx.ALL, 5)
+        # engine_radio_panel_sizer.Add(cuda_radio, 0, wx.ALL, 5)
+        # cpu_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cpu'))
+        # cuda_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cuda'))
 
         # Create a list of voices with flags
         flag_and_voice_list = []
@@ -319,6 +318,10 @@ class MainWindow(wx.Frame):
         sizer.Add(output_folder_label, pos=(3, 0), flag=wx.ALL, border=border)
         sizer.Add(self.output_folder_text_ctrl, pos=(3, 1), flag=wx.ALL | wx.EXPAND, border=border)
         sizer.Add(output_folder_button, pos=(4, 1), flag=wx.ALL, border=border)
+        url_label = wx.StaticText(panel, label="API Base URL:")
+        self.url_text_input = wx.TextCtrl(panel, value="https://xps15.tail2c693e.ts.net:8443/v1")
+        sizer.Add(url_label, pos=(5, 0), flag=wx.ALL, border=border)
+        sizer.Add(self.url_text_input, pos=(5, 1), flag=wx.ALL | wx.EXPAND, border=border)
 
     def create_synthesis_panel(self):
         # Think and identify layout issue with the folling code
@@ -484,16 +487,23 @@ class MainWindow(wx.Frame):
 
         def generate_preview():
             import audiblez.core as core
-            from kokoro import KPipeline
-            pipeline = KPipeline(lang_code=lang_code)
+            from openai import OpenAI
+            
+            client = OpenAI(
+                base_url=self.url_text_input.GetValue(),
+                api_key="not-needed"
+            )
             core.load_spacy()
             text = self.selected_chapter.extracted_text[:300]
             if len(text) == 0: return
+            
+            # Pass client instead of pipeline
             audio_segments = core.gen_audio_segments(
-                pipeline,
+                client,
                 text,
                 voice=self.get_selected_voice(),
                 speed=self.get_selected_speed())
+                
             final_audio = np.concatenate(audio_segments)
             tmp_preview_wav_file = NamedTemporaryFile(suffix='.wav', delete=False)
             soundfile.write(tmp_preview_wav_file, final_audio, core.sample_rate)
@@ -530,7 +540,8 @@ class MainWindow(wx.Frame):
         self.core_thread = CoreThread(params=dict(
             file_path=file_path, voice=voice, pick_manually=False, speed=speed,
             output_folder=self.output_folder_text_ctrl.GetValue(),
-            selected_chapters=selected_chapters))
+            selected_chapters=selected_chapters,
+            base_url=self.url_text_input.GetValue())) # Pass parameter to core.main
         self.core_thread.start()
 
     def on_open(self, event):

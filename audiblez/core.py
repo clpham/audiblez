@@ -7,7 +7,6 @@ import os
 import traceback
 from glob import glob
 
-import torch.cuda
 import spacy
 import ebooklib
 import soundfile
@@ -23,7 +22,8 @@ from tabulate import tabulate
 from pathlib import Path
 from string import Formatter
 from bs4 import BeautifulSoup
-from kokoro import KPipeline
+import io
+from openai import OpenAI
 from ebooklib import epub
 from pick import pick
 
@@ -70,7 +70,7 @@ def set_espeak_library():
 
 
 def main(file_path, voice, pick_manually, speed, output_folder='.',
-         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None):
+         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None, base_url="https://xps15.tail2c693e.ts.net:8443/v1"):
     if post_event: post_event('CORE_STARTED')
     load_spacy()
     if output_folder != '.':
@@ -107,14 +107,21 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
     stats = SimpleNamespace(
         total_chars=sum(map(len, texts)),
         processed_chars=0,
-        chars_per_sec=500 if torch.cuda.is_available() else 50)
+        progress=0,             # Initialize progress to prevent the UI AttributeError
+        start_time=time.time(), # Added earlier for dynamic ETA tracking
+        chars_per_sec=250)
     print('Started at:', time.strftime('%H:%M:%S'))
     print(f'Total characters: {stats.total_chars:,}')
     print('Total words:', len(' '.join(texts).split()))
     eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
     print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
     set_espeak_library()
-    pipeline = KPipeline(lang_code=voice[0])  # a for american or b for british etc.
+
+    # Initialize OpenAI Client
+    client = OpenAI(
+        base_url=base_url,
+        api_key="not-needed"
+    )
 
     chapter_wav_files = []
     for i, chapter in enumerate(selected_chapters, start=1):
@@ -139,7 +146,7 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_segments = gen_audio_segments(
-            pipeline, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
+            client, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -205,45 +212,111 @@ def split_long_sentence(text, max_length=400):
     return parts
 
 
-def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=None, post_event=None):
+def gen_audio_segments(client, text, voice, speed, stats=None, max_sentences=None, post_event=None):
     nlp = spacy.load('xx_ent_wiki_sm')
     nlp.add_pipe('sentencizer')
     audio_segments = []
     doc = nlp(text)
-    lang_code = voice[0]
+    
+    # 1. Extract sentences using spaCy
+    sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+    
+    # 2. Batch sentences into ~4000 character chunks to minimize HTTP requests
+    MAX_CHARS = 4000
+    chunks = []
+    current_chunk = ""
+    
+    for sent in sentences:
+        if len(current_chunk) + len(sent) + 1 > MAX_CHARS and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = sent
+        else:
+            current_chunk = (current_chunk + " " + sent).strip()
+            
+    if current_chunk:
+        chunks.append(current_chunk)
 
-    if lang_code in 'ab':
-        sentences = [s.text for s in doc.sents]
-    else:
-        # For non-english languages, Kokoro truncates long sentences, so we split them manually
-        sentences = []
-        for sent in list(doc.sents):
-            if len(sent.text) > 400:
-                print(f'Warning: Sentence too long ({len(sent.text)} chars), splitting into smaller sentences.')
-                sents = split_long_sentence(sent.text, 400)
-                sentences.extend(sents)
-            else:
-                sentences.append(sent.text)
-
-    for i, sent_text in enumerate(sentences):
+    # 3. Send batched chunks to the FastAPI server
+    for i, chunk_text in enumerate(chunks):
         if max_sentences and i > max_sentences: break
-        for gs, ps, audio in pipeline(sent_text, voice=voice, speed=speed, split_pattern=r'\n\n\n'):
-            audio_segments.append(audio)
+        
+        # --- Add this block BEFORE the API call ---
         if stats:
-            stats.processed_chars += len(sent_text)
+            stats.eta = f"Processing chunk {i+1} of {len(chunks)}... (waiting for API)"
+            if post_event: post_event('CORE_PROGRESS', stats=stats)
+        # ------------------------------------------
+        
+        # # Blocking network call
+        # response = client.audio.speech.create(
+        #     model="kokoro",
+        #     voice=voice,
+        #     input=chunk_text,
+        #     response_format="wav",
+        #     speed=speed
+        # )
+        
+        # audio_data, _ = soundfile.read(io.BytesIO(response.content))
+        # audio_segments.append(audio_data)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = client.audio.speech.create(
+                    model="kokoro",
+                    voice=voice,
+                    input=chunk_text,
+                    response_format="wav",
+                    speed=speed,
+                    timeout=45.0 # Explicit timeout to prevent indefinite hangs
+                )
+                
+                audio_data, _ = soundfile.read(io.BytesIO(response.content))
+                audio_segments.append(audio_data)
+                break # Success: exit the retry loop
+                
+            except (openai.APIConnectionError, openai.APITimeoutError) as e:
+                print(f"\nNetwork error on chunk {i+1} (Attempt {attempt+1}/{max_retries}): {e}")
+                time.sleep(2)
+            except openai.APIStatusError as e:
+                print(f"\nServer error {e.status_code} on chunk {i+1} (Attempt {attempt+1}/{max_retries}): {e}")
+                time.sleep(2)
+            except Exception as e:
+                print(f"\nUnexpected error on chunk {i+1}: {e}")
+                break
+        else:
+            print(f"\nFailed to process chunk {i+1} after {max_retries} attempts. Appending 2 seconds of silence.")
+            # Generate 2 seconds of silence matching the 24kHz sample rate
+            silence = np.zeros(2 * sample_rate, dtype=np.float32)
+            audio_segments.append(silence)
+
+        # ... (existing post-API stats update remains here) ...
+        
+        if stats:
+            stats.processed_chars += len(chunk_text)
             stats.progress = stats.processed_chars * 100 // stats.total_chars
-            stats.eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
+            
+            # Calculate real-time speed based on actual API response times
+            elapsed_time = time.time() - stats.start_time
+            if elapsed_time > 0:
+                current_cps = stats.processed_chars / elapsed_time
+            else:
+                current_cps = stats.chars_per_sec
+                
+            # Generate the new ETA using the dynamic speed
+            remaining_chars = stats.total_chars - stats.processed_chars
+            stats.eta = strfdelta(remaining_chars / current_cps)
+            
             if post_event: post_event('CORE_PROGRESS', stats=stats)
             print(f'Estimated time remaining: {stats.eta}')
-            print('Progress:', f'{stats.progress}%\n')
+            print('Progress:', f'{stats.progress}%\n')    
     return audio_segments
 
-
-def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False):
-    lang_code = voice[:1]
-    pipeline = KPipeline(lang_code=lang_code, repo_id='hexgrad/Kokoro-82M')
+def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False, base_url="https://xps15.tail2c693e.ts.net:8443/v1"):
+    client = OpenAI(
+        base_url=base_url,
+        api_key="not-needed"
+    )
     load_spacy()
-    audio_segments = gen_audio_segments(pipeline, text, voice=voice, speed=speed);
+    audio_segments = gen_audio_segments(client, text, voice=voice, speed=speed)
     final_audio = np.concatenate(audio_segments)
     soundfile.write(output_file, final_audio, sample_rate)
     if play:
@@ -325,13 +398,15 @@ def concat_wavs_with_ffmpeg(chapter_files, output_folder, filename):
     wav_list_txt = Path(output_folder) / filename.replace('.epub', '_wav_list.txt')
     with open(wav_list_txt, 'w') as f:
         for wav_file in chapter_files:
-            f.write(f"file '{wav_file}'\n")
+            f.write(f"file '{wav_file.absolute()}'\n")
     concat_file_path = Path(output_folder) / filename.replace('.epub', '.tmp.mp4')
     subprocess.run([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', wav_list_txt,
         # '-c', 'copy',
-        '-c:a',  'libfdk_aac',
+        # '-c:a',  'libfdk_aac',
+        '-c:a',  'aac',
         '-b:a',  '192k',
+        '-ar',  '48000',
         concat_file_path])
     Path(wav_list_txt).unlink()
     return concat_file_path
@@ -374,10 +449,20 @@ def create_m4b(chapter_files, filename, cover_image, output_folder):
         f'{final_filename}'  # Output file
     ])
 
+    # Path(concat_file_path).unlink()
+    # if proc.returncode == 0:
+    #     print(f'{final_filename} created. Enjoy your audiobook.')
+    #     print('Feel free to delete the intermediary .wav chapter files, the .m4b is all you need.')
     Path(concat_file_path).unlink()
     if proc.returncode == 0:
         print(f'{final_filename} created. Enjoy your audiobook.')
-        print('Feel free to delete the intermediary .wav chapter files, the .m4b is all you need.')
+        print('Cleaning up intermediate .wav chapter files...')
+        
+        for wav_file in chapter_files:
+            try:
+                Path(wav_file).unlink(missing_ok=True)
+            except Exception as e:
+                print(f"Could not delete {wav_file}: {e}")
 
 
 def probe_duration(file_name):
